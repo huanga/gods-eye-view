@@ -21,3 +21,6 @@ qa-artifacts/
 3d-models/
 pinokio/ENVIRONMENT
 pinokio/.installed
+.env
+docker-compose.override.yaml
+!.env.docker.example

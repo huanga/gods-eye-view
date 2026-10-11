@@ -1,0 +1,101 @@
+name: Build and push container image
+
+on:
+  push:
+    branches: [dockerize]
+    tags: ['v*']
+  pull_request:
+    branches: [dockerize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          # PRs get no tags (build-only check). dockerize pushes get a moving
+          # branch tag; version tags get semver tags.
+          tags: |
+            type=ref,event=branch,enable=${{ github.event_name != 'pull_request' }}
+            type=semver,pattern={{version}},enable=${{ github.event_name != 'pull_request' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name != 'pull_request' }}
+            type=sha,format=short,enable=${{ github.event_name != 'pull_request' }}
+
+      # Build-time args/vars for the client-exposed keys. These bake into the
+      # static bundle and are visible in browser devtools by design; for CI
+      # builds they are empty placeholders. Supply real values as build args
+      # in your own build environment if you want the Google 3D / Cesium ion /
+      # Mapillary layers populated.
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=container
+          cache-to: type=gha,mode=max,scope=container
+          build-args: |
+            GOOGLE_MAPS_API_KEY=
+            CESIUM_ION_TOKEN=
+            MAPILLARY_CLIENT_TOKEN=
+
+      # Smoke test on PRs: the image must start, bind, and serve the built
+      # bundle on the expected port. Tags it locally first so we reference the
+      # image we just built, not whatever happens to be newest on the runner.
+      - name: Smoke test the built image
+        if: github.event_name == 'pull_request'
+        run: |
+          docker build -t gev-smoke:local .
+          docker run -d --name gev-smoke -p 4173:4173 gev-smoke:local
+          for attempt in $(seq 1 30); do
+            if curl -sf http://localhost:4173/ > /dev/null 2>&1; then
+              echo "SMOKE_TEST:PASS"
+              docker logs gev-smoke 2>&1 | tail -20
+              docker rm -f gev-smoke
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "SMOKE_TEST:FAIL"
+          docker logs gev-smoke 2>&1 | tail -50
+          docker rm -f gev-smoke
+          exit 1

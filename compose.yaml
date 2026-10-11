@@ -1,0 +1,68 @@
+# God's Eye View — reference compose stack.
+#
+# Two profiles:
+#
+#   default  The app behind your existing reverse proxy / identity provider.
+#            Traefik labels here assume an external docker network named
+#            "proxy" and an entrypoint named "websecure"; adjust to your
+#            environment. The app has NO authentication of its own and
+#            brokers spendable API keys — always gate it behind your IdP
+#            (e.g. Authentik forward-auth middleware) before exposing it.
+#
+#   mcp      Optional MCP sidecar: bridges the app's loopback-only MCP
+#            server to HTTP so it can sit behind the same proxy + IdP.
+#            The app itself is untouched — the sidecar shares its network
+#            namespace and presents the loopback shape the app requires.
+#
+# Required env vars (see .env.docker.example): at minimum set
+# GEV_ALLOWED_HOSTS to the exact public hostname(s) you serve on, and the
+# GEV_PROXY_NETWORK / GEV_PROXY_ENTRYPOINT / GEV_MCP_HOSTNAME overrides to
+# match your proxy.
+
+services:
+  gods-eye-view:
+    build: .
+    image: gods-eye-view:latest
+    restart: unless-stopped
+    env_file: .env
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gods-eye-view.rule=Host(`${GEV_APP_HOSTNAME:?set GEV_APP_HOSTNAME in .env}`)"
+      - "traefik.http.routers.gods-eye-view.entrypoints=${GEV_PROXY_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.gods-eye-view.tls.certresolver=${GEV_CERT_RESOLVER:-letsencrypt}"
+      - "traefik.http.routers.gods-eye-view.middlewares=${GEV_AUTH_MIDDLEWARE:?set GEV_AUTH_MIDDLEWARE in .env}"
+      - "traefik.http.services.gods-eye-view.loadbalancer.server.port=4173"
+    networks:
+      - proxy
+
+  # -------------------------------------------------------------------------
+  # Optional MCP sidecar (docker compose --profile mcp up).
+  #
+  # `network_mode: service:gods-eye-view` puts this container on the app's
+  # loopback, so the stdio MCP server can reach http://localhost:4173 and
+  # mcp-remote can bridge it to HTTP. Traefik therefore cannot also publish
+  # this service by port; if you want the MCP endpoint reachable through the
+  # same proxy, give the app a second Traefik route on a distinct hostname
+  # and let mcp-remote listen on a second port here (see GEV_MCP_PORT).
+  # -------------------------------------------------------------------------
+  mcp:
+    image: node:24-alpine
+    profiles: ["mcp"]
+    restart: unless-stopped
+    network_mode: service:gods-eye-view
+    working_dir: /app
+    command:
+      - /bin/sh
+      - -c
+      - |
+        npx -y mcp-remote http://127.0.0.1:4173/mcp \
+          --host 0.0.0.0 --port $${GEV_MCP_PORT:-4174} --allow-http
+    volumes:
+      - ./:/app:ro
+    depends_on:
+      - gods-eye-view
+
+networks:
+  proxy:
+    external: true
+    name: ${GEV_PROXY_NETWORK:-proxy}
